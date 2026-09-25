@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import h5py
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -31,7 +32,6 @@ class Lindblad(TreeNode):
     U: torch.Tensor  #: Low-rank approximation to P and Pbar (left factor)
     Vdag: torch.Tensor  #: Low-rank approximation to P and Pbar (right factor)
 
-    @stopwatch
     def __init__(
         self,
         *,
@@ -40,6 +40,7 @@ class Lindblad(TreeNode):
         scale_factor: float = 1.0,
         detailed_balance: str = "single",
         low_rank_file: str = "",
+        max_rank: int | None = None,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         """
@@ -55,17 +56,26 @@ class Lindblad(TreeNode):
         self.detailed_balance = detailed_balance
         self.low_rank_file = low_rank_file
 
+        nk = ab_initio.k_division.n_tot
+        rho_eyeT = torch.tile(ab_initio.eye_bands[None], (nk, 1, 1))[..., None]
         if low_rank_file:
-            # TODO: load U and Vdag and then skip P initialization below
-            raise NotImplementedError
+            n_bands_sq = ab_initio.n_bands**2
+            kdiv = ab_initio.k_division
+            kbb_mine = slice(kdiv.i_start * n_bands_sq, kdiv.i_stop * n_bands_sq)
+            
+            with h5py.File(low_rank_file) as fp:
+                self.U = torch.from_numpy(fp["U"][:, kbb_mine, :max_rank]).to(rc.device)
+                self.Vdag = torch.from_numpy(fp["Vdag"][:, :max_rank, :]).to(rc.device)
+            self.P_eye = apply_low_rank_batched(self.U, self.Vdag, rho_eyeT)
+        else:
+            self.P = self.constructP(data_file, detailed_balance)
+            self.P_eye = apply_batched(self.P, rho_eyeT)
 
         if detailed_balance == "spatial":
             max_dmu = 1e-3
             eps = 1e-12
             dmu_eps = 1e-8
-
             self.mu0 = torch.ones(1, 1).to(rc.device) * ab_initio.mu
-
             self.max_dbetamu = max_dmu / ab_initio.T
             self.max_dmu = max_dmu
             self.eps = float(eps)
@@ -77,10 +87,30 @@ class Lindblad(TreeNode):
                 f"{detailed_balance} detailed_balance only has spatial, single, and none implemented"
             )
 
+        if detailed_balance in ["none", "emission"]:
+            log.info(
+                f"Setting rho_dot0 to zero for {detailed_balance} detailed balance scheme"
+            )
+            self.rho_dot0 = 0
+        else:
+            log.info(
+                f"Computing rho_dot0 for {detailed_balance} detailed balance scheme"
+            )
+            ph = ab_initio.packed_hermitian
+            self.rho_dot0 = self._calculate(ph.unpack(ab_initio.rho0))
+
+        self.constant_params = dict(
+            scale_factor=torch.tensor(scale_factor, device=rc.device)
+        )
+        self.scale_factor = dict()
+
+    @stopwatch
+    def constructP(self, data_file: Checkpoint, detailed_balance: str) -> torch.Tensor:
         if not bool(data_file.attrs["ePhEnabled"]):
             raise InvalidInputException("No e-ph scattering available in data file")
-
         log.info("Constructing P tensor")
+        
+        ab_initio = self.ab_initio
         nk = ab_initio.k_division.n_tot
         ik_start = ab_initio.k_division.i_start
         ik_stop = ab_initio.k_division.i_stop
@@ -173,35 +203,16 @@ class Lindblad(TreeNode):
                     P[0].index_add_(0, i_pair, wm[sel] * Gsq_)  # P contribution
                 P[1].index_add_(0, i_pair, wm[sel] * Gsq)  # Pbar contribution
 
-        op_shape = (2, nk_mine * n_bands_sq, nk * n_bands_sq)
-        self.P = P.unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
-
-        # Finishing up ...
-        # TODO: replace P with U and Vdag below if low_rank_file
-        self.P_eye = apply_batched(
-            self.P, torch.tile(ab_initio.eye_bands[None], (nk, 1, 1))[..., None]
-        )
+        # Report sparsity:
         ntotP = 2 * (nk * n_bands_sq) ** 2
-        nnzP = torch.count_nonzero(self.P)
-        dist.all_reduce(nnzP, ab_initio.group)
+        nnzP = torch.count_nonzero(P)
+        dist.all_reduce(nnzP, group=ab_initio.group)
         fill_percent_P = 100.0 * nnzP.item() / ntotP
         log.info(f"P tensor fill fraction: {fill_percent_P:.1f}%")
-
-        if detailed_balance in ["none", "emission"]:
-            log.info(
-                f"Setting rho_dot0 to zero for {detailed_balance} detailed balance scheme"
-            )
-            self.rho_dot0 = 0
-        else:
-            log.info(
-                f"Computing rho_dot0 for {detailed_balance} detailed balance scheme"
-            )
-            self.rho_dot0 = self._calculate(ph.unpack(ab_initio.rho0))
-
-        self.constant_params = dict(
-            scale_factor=torch.tensor(scale_factor, device=rc.device)
-        )
-        self.scale_factor = dict()
+        
+        # Reshape for flattened-rho evaluation
+        op_shape = (2, nk_mine * n_bands_sq, nk * n_bands_sq)
+        return P.unflatten(1, (nk_mine, nk)).swapaxes(2, 3).reshape(op_shape)
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -319,3 +330,6 @@ def apply_low_rank_batched(
     Vdag_rho = torch.einsum("ink, k... -> in...", Vdag, rho.flatten(0, 2))
     result = torch.einsum("ikn, in... -> i...k", U, Vdag_rho)
     return result.unflatten(-1, (-1,) + rho.shape[1:3])
+
+
+
