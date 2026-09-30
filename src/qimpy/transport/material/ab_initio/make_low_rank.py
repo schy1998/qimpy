@@ -2,8 +2,8 @@ import argparse
 import time
 
 import h5py
+import torch
 import numpy as np
-import scipy.linalg
 import matplotlib.pyplot as plt
 
 import qimpy
@@ -25,14 +25,48 @@ def generate_low_rank(
     ab_initio = AbInitio(**ab_initio, process_grid=process_grid)
     assert not ab_initio.lindblad.low_rank_file
 
+    # Construct Fermi-prime weights:
+    f = torch.diagonal(ab_initio.rho0.real[0], dim1=1, dim2=2)
+    E = ab_initio.E
+    minus_df_dE = f[:, :, None] * (1 - f[:, None, :]) / ab_initio.T  # degenerate case
+    df = f[:, :, None] - f[:, None, :]
+    dE = E[:, :, None] - E[:, None, :]
+    nondeg = (dE.abs() > 1.0E-3 * ab_initio.T)  # non-degenerate selection
+    minus_df_dE[nondeg] = -df[nondeg] / dE[nondeg]
+    w = minus_df_dE.flatten().sqrt().detach().to(rc.cpu).numpy()  # TODO: also test without sqrt
+    
     # Full Lindblad operators P and Pbar are stacked along dimension 0:
     # P.shape = (2, N_out, N_in)
     P = ab_initio.lindblad.P.detach().to(rc.cpu).numpy()  # to CPU/NumPy for SVD
 
     log.info(f"Lindblad tensor shape: {P.shape}")
-
+    P *= w  # scale last dimension
+    P *= w[:, None]  # scale penultimate dimension
+    
     U, S, Vdag = np.linalg.svd(P, full_matrices=False)
 
+    # Undo Fermi-prime weighting
+    U *= 1 / w[:, None]
+    Vdag *= 1 / w
+
+    # Enforce exact number conservation on every column of U.
+    # Reshape flattened k,b,b index back to (k,b,b).
+    U = U.reshape(U.shape[:1] + dE.shape + U.shape[-1:])
+    w_diag = np.copy(w).reshape(dE.shape)
+    w_diag *= ab_initio.eye_bands.detach().to(rc.cpu).numpy()
+    Udiag_mean = np.einsum("pkbbK->pK", U) / w_diag.sum()
+    U -= np.einsum("pK, kab -> pkabK", Udiag_mean, w_diag)
+    
+    # Verify that each U column now has zero trace
+    trace_check = np.einsum("pkbbK->pK", U)
+    log.info(
+        f"Max residual U-column trace: {np.max(np.abs(trace_check)):.6e}"
+    )
+
+    # Flatten (k,b,b) back into the matrix index.
+    U = U.reshape(U.shape[:1] + (-1,) + U.shape[-1:])
+
+    # Compactify and truncate SVD
     sqrtS = np.sqrt(S[..., :max_rank])
 
     U = U[..., :max_rank] * sqrtS[:, None, :]
