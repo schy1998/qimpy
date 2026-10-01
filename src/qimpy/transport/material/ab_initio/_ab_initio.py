@@ -288,16 +288,25 @@ class AbInitio(Material):
     ) -> None:
         self.initialize_fields_local(rho, patch_id, **params)
 
+        
+        
+        
     def initialize_fields_local(
         self,
         rho: torch.Tensor,
         patch_id: int,
         *,
         pumpB: torch.Tensor | None = None,
+        pumpE: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         if pumpB is not None:
             H0 = torch.diag_embed(self.E) + self.zeemanH(pumpB)
+            rho[:] = self.rho_fermi(H0, self.mu)[0].flatten(-3, -1)
+
+        if pumpE is not None:
+            v_dot_E = torch.einsum("kbi,i->kb", self.v, pumpE)
+            H0 = torch.diag_embed(self.E + v_dot_E)
             rho[:] = self.rho_fermi(H0, self.mu)[0].flatten(-3, -1)
 
         for term_name, dynamics_term in self.dynamics_terms.items():
