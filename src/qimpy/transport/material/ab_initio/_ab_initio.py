@@ -305,10 +305,12 @@ class AbInitio(Material):
             rho[:] = self.rho_fermi(H0, self.mu)[0].flatten(-3, -1)
 
         if pumpE is not None:
-            v_dot_E = torch.einsum("kbi,i->kb", self.v, pumpE)
-            H0 = torch.diag_embed(self.E + v_dot_E)
+            v_dot_E = torch.einsum("kbi,...i->...kb", self.v, pumpE)
+            H0 = torch.diag_embed(
+                (self.E + v_dot_E).to(torch.complex128)
+            )
             rho[:] = self.rho_fermi(H0, self.mu)[0].flatten(-3, -1)
-
+            
         for term_name, dynamics_term in self.dynamics_terms.items():
             params = dict(**dynamics_term.constant_params)  # default constant values
             prefix = f"{term_name}_"

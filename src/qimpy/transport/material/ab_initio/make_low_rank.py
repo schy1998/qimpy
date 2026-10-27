@@ -29,12 +29,14 @@ def orthonormalize_observables(M, tol=1e-10):
     return Q
 
 
+
 def construct_observable_basis(ab_initio, N):
     """
-    Construct protected charge and spin observable vectors
+    Construct protected charge and momentum observable vectors
     in the packed-Hermitian representation.
 
-    The flattened vector ordering must match Lindblad.P.
+    Protected observables: I, Px, Py, Pz.
+    The flattened ordering must match Lindblad.P.
     """
     nk = ab_initio.k_division.n_tot
     nb = ab_initio.n_bands
@@ -46,33 +48,34 @@ def construct_observable_basis(ab_initio, N):
             f"expected {nk * nb**2}."
         )
 
-    # Identity operator for charge:
+    # Identity operator for charge
+    momentum = ab_initio.P
+
     identity = torch.eye(
-        nb, dtype=ab_initio.S.dtype, device=rc.device
+        nb,
+        dtype=momentum.dtype,
+        device=momentum.device,
     )
     identity = identity[None].expand(nk, -1, -1)
 
-    # Spin operators:
+    # Momentum operators: Px, Py, Pz
     # Expected shape: (nk, 3, nb, nb)
-    spin = ab_initio.S
-
-    if spin.shape != (nk, 3, nb, nb):
+    if momentum.shape != (nk, 3, nb, nb):
         raise ValueError(
-            f"Unexpected spin tensor shape: {spin.shape}. "
+            f"Unexpected momentum tensor shape: {momentum.shape}. "
             f"Expected ({nk}, 3, {nb}, {nb})."
         )
 
-    # Operators indexed as (observable, k, band, band)
+    # Shape: (4, nk, nb, nb)
     operators = torch.cat(
         (
             identity[None],
-            spin.permute(1, 0, 2, 3),
+            momentum.permute(1, 0, 2, 3),
         ),
         dim=0,
     )
 
-    # Convert to the same real packed-Hermitian
-    # representation used by Lindblad.P.
+    # Pack into the same representation used by Lindblad
     packed = ph.pack(operators)
 
     M = (
@@ -83,7 +86,6 @@ def construct_observable_basis(ab_initio, N):
     )
 
     return orthonormalize_observables(M)
-
 
 
 def protected_low_rank(P, Q_left, Q_right, max_rank):
@@ -147,14 +149,20 @@ def protected_low_rank(P, Q_left, Q_right, max_rank):
     # Step 3: Truncated SVD of the residual
     # -----------------------------------------
 
-    Ur, S, Vhr = np.linalg.svd(
-        residual, full_matrices=False
-    )
 
-    residual_rank = min(
-        max_rank - protected_rank,
-        len(S),
-    )
+    residual_rank = max_rank - protected_rank
+
+    if residual_rank == 0:
+        # All 8 factor columns are used by protected blocks.
+        # No residual SVD is necessary.
+        Ur = np.empty((N_out, 0), dtype=P.dtype)
+        S = np.empty((0,), dtype=float)
+        Vhr = np.empty((0, N_in), dtype=P.dtype)
+    else:
+        Ur, S, Vhr = np.linalg.svd(
+            residual, full_matrices=False
+        )
+        residual_rank = min(residual_rank, len(S))
 
     # Keep only the selected singular modes
     Ur = Ur[:, :residual_rank]
