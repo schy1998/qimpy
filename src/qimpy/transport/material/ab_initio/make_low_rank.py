@@ -1,15 +1,259 @@
 import argparse
-import time
-
 import h5py
 import numpy as np
-import matplotlib.pyplot as plt
-
+import torch
 import qimpy
 from qimpy import log, rc, io
 from qimpy.mpi import ProcessGrid
 from qimpy.profiler import StopWatch
 from . import AbInitio
+
+def orthonormalize_observables(M, tol=1e-10):
+    """
+    Construct an orthonormal basis for the columns of M.
+
+    M.shape = (N, n_observables)
+    """
+    U, S, _ = np.linalg.svd(M, full_matrices=False)
+
+    if not len(S) or S[0] == 0:
+        raise ValueError("No nonzero observable vectors found.")
+
+    keep = S > tol * S[0]
+    Q = U[:, keep]
+
+    log.info(
+        f"Protected observable subspace dimension: {Q.shape[1]}"
+    )
+
+    return Q
+
+
+def construct_observable_basis(ab_initio, N):
+    """
+    Construct protected charge and spin observable vectors
+    in the packed-Hermitian representation.
+
+    The flattened vector ordering must match Lindblad.P.
+    """
+    nk = ab_initio.k_division.n_tot
+    nb = ab_initio.n_bands
+    ph = ab_initio.packed_hermitian
+
+    if N != nk * nb**2:
+        raise ValueError(
+            f"Unexpected Lindblad dimension {N}; "
+            f"expected {nk * nb**2}."
+        )
+
+    # Identity operator for charge:
+    identity = torch.eye(
+        nb, dtype=ab_initio.S.dtype, device=rc.device
+    )
+    identity = identity[None].expand(nk, -1, -1)
+
+    # Spin operators:
+    # Expected shape: (nk, 3, nb, nb)
+    spin = ab_initio.S
+
+    if spin.shape != (nk, 3, nb, nb):
+        raise ValueError(
+            f"Unexpected spin tensor shape: {spin.shape}. "
+            f"Expected ({nk}, 3, {nb}, {nb})."
+        )
+
+    # Operators indexed as (observable, k, band, band)
+    operators = torch.cat(
+        (
+            identity[None],
+            spin.permute(1, 0, 2, 3),
+        ),
+        dim=0,
+    )
+
+    # Convert to the same real packed-Hermitian
+    # representation used by Lindblad.P.
+    packed = ph.pack(operators)
+
+    M = (
+        packed.reshape(packed.shape[0], -1)
+        .T.detach()
+        .to(rc.cpu)
+        .numpy()
+    )
+
+    return orthonormalize_observables(M)
+
+
+
+def protected_low_rank(P, Q_left, Q_right, max_rank):
+    """
+    Observable-preserving low-rank approximation
+    following the professor's compact factorization.
+
+    Preserve the three protected blocks exactly.
+    Apply truncated SVD only to the fourth block.
+
+    max_rank is the total output factor rank.
+    """
+
+    N_out, N_in = P.shape
+
+    ml = Q_left.shape[1]
+    mr = Q_right.shape[1]
+
+    if Q_left.shape[0] != N_out:
+        raise ValueError("Left basis dimension mismatch.")
+
+    if Q_right.shape[0] != N_in:
+        raise ValueError("Right basis dimension mismatch.")
+
+    protected_rank = ml + mr
+
+    if max_rank < protected_rank:
+        raise ValueError(
+            f"max_rank={max_rank} is too small. "
+            f"Need at least {protected_rank}."
+        )
+
+    # -----------------------------------------
+    # Step 1: Construct protected contributions
+    # -----------------------------------------
+
+    # P Q_right
+    B = P @ Q_right
+
+    # Q_left^dagger P
+    C = Q_left.conj().T @ P
+
+    # Q_left^dagger P Q_right
+    A = Q_left.conj().T @ B
+
+    # -----------------------------------------
+    # Step 2: Construct the fourth block
+    #
+    # R_left P R_right
+    # where R = I - Q Q^dagger
+    # -----------------------------------------
+
+    residual = (
+        P
+        - B @ Q_right.conj().T
+        - Q_left @ C
+        + Q_left @ A @ Q_right.conj().T
+    )
+
+    # -----------------------------------------
+    # Step 3: Truncated SVD of the residual
+    # -----------------------------------------
+
+    Ur, S, Vhr = np.linalg.svd(
+        residual, full_matrices=False
+    )
+
+    residual_rank = min(
+        max_rank - protected_rank,
+        len(S),
+    )
+
+    # Keep only the selected singular modes
+    Ur = Ur[:, :residual_rank]
+    Sr = S[:residual_rank]
+    Vhr = Vhr[:residual_rank, :]
+
+    # Check that residual SVD modes lie
+    # outside the protected subspaces
+    left_orthogonality = np.linalg.norm(
+        Q_left.conj().T @ Ur
+    )
+
+    right_orthogonality = np.linalg.norm(
+        Vhr @ Q_right
+    )
+
+    # Absorb sqrt(Sigma) into both factors
+    sqrtS = np.sqrt(Sr)
+
+    Ur_scaled = Ur * sqrtS[None, :]
+    Vhr_scaled = sqrtS[:, None] * Vhr
+
+    # -----------------------------------------
+    # Step 4: Professor's compact factorization
+    #
+    # U_final = [P Q - Q(Q^dagger P Q),
+    #            Q,
+    #            U_r sqrt(Sigma)]
+    #
+    # Vdag_final = [Q^dagger;
+    #               Q^dagger P;
+    #               sqrt(Sigma) V_r^dagger]
+    # -----------------------------------------
+
+    U_final = np.concatenate(
+        (
+            B - Q_left @ A,
+            Q_left,
+            Ur_scaled,
+        ),
+        axis=1,
+    )
+
+    Vdag_final = np.concatenate(
+        (
+            Q_right.conj().T,
+            C,
+            Vhr_scaled,
+        ),
+        axis=0,
+    )
+
+    # -----------------------------------------
+    # Step 5: Validate the approximation
+    # -----------------------------------------
+
+    P_approx = U_final @ Vdag_final
+
+    normP = np.linalg.norm(P)
+
+    relative_error = (
+        np.linalg.norm(P - P_approx) / normP
+        if normP > 0 else 0.0
+    )
+
+    right_error = np.linalg.norm(
+        (P - P_approx) @ Q_right
+    )
+
+    left_error = np.linalg.norm(
+        Q_left.conj().T @ (P - P_approx)
+    )
+
+    log.info(
+        f"Total factor rank: {U_final.shape[1]}"
+    )
+    log.info(
+        f"Residual SVD rank: {residual_rank}"
+    )
+    log.info(
+        f"Relative reconstruction error: "
+        f"{relative_error:.6e}"
+    )
+    log.info(
+        f"Protected right error: {right_error:.6e}"
+    )
+    log.info(
+        f"Protected left error: {left_error:.6e}"
+    )
+    log.info(
+        f"Residual left orthogonality: "
+        f"{left_orthogonality:.6e}"
+    )
+    log.info(
+        f"Residual right orthogonality: "
+        f"{right_orthogonality:.6e}"
+    )
+
+    return U_final, S, Vdag_final
 
 
 def generate_low_rank(
@@ -18,123 +262,89 @@ def generate_low_rank(
     low_rank_file: str,
     max_rank: int,
 ) -> None:
-    """Calculate singular-value spectra of ab_initio.lindblad.P."""
+    """
+    Generate observable-preserving low-rank
+    approximations to Lindblad P and Pbar.
+    """
 
     process_grid = ProcessGrid("rk", (1, -1))
-    ab_initio = AbInitio(**ab_initio, process_grid=process_grid)
+
+    ab_initio = AbInitio(
+        **ab_initio,
+        process_grid=process_grid,
+    )
+
     assert not ab_initio.lindblad.low_rank_file
 
-    # Full Lindblad operators P and Pbar are stacked along dimension 0:
+    # Full Lindblad matrices:
     # P.shape = (2, N_out, N_in)
-    P = ab_initio.lindblad.P.detach().to(rc.cpu).numpy()
+    P = (
+        ab_initio.lindblad.P
+        .detach()
+        .to(rc.cpu)
+        .numpy()
+    )
 
     log.info(f"Lindblad tensor shape: {P.shape}")
 
-    # Ordinary unweighted SVD
-    U, S, Vdag = np.linalg.svd(P, full_matrices=False)
+    N_out, N_in = P.shape[1:]
 
-    # Compactify and truncate SVD
-    sqrtS = np.sqrt(S[..., :max_rank])
+    # Construct protected observable bases.
+    # Current ProcessGrid is intended to
+    # construct the complete operator.
+    if N_out != N_in:
+        raise ValueError(
+            "This implementation requires a square "
+            "global Lindblad matrix."
+        )
 
-    U = U[..., :max_rank] * sqrtS[:, None, :]
-    Vdag = Vdag[..., :max_rank, :] * sqrtS[:, :, None]
+    Q = construct_observable_basis(
+        ab_initio, N_in
+    )
 
-    # Write to file:
+    U_list = []
+    S_list = []
+    Vdag_list = []
+
+    for i, name in enumerate(("P", "Pbar")):
+
+        log.info(
+            f"Constructing protected low-rank {name}"
+        )
+
+        U, S, Vdag = protected_low_rank(
+            P[i],
+            Q,
+            Q,
+            max_rank,
+        )
+
+        U_list.append(U)
+        S_list.append(S)
+        Vdag_list.append(Vdag)
+
+    U = np.stack(U_list, axis=0)
+    S = np.stack(S_list, axis=0)
+    Vdag = np.stack(Vdag_list, axis=0)
+
+    # Save in the same format expected by
+    # the existing _lindblad.py.
     with h5py.File(low_rank_file, "w") as fp:
         fp["S"] = S
         fp["U"] = U
         fp["Vdag"] = Vdag
 
-    return
+    log.info(
+        f"Saved protected low-rank factors to {low_rank_file}"
+    )
 
-    # -----------------------------------
-    
-    singular_values = []
-    
-
-    for i, name in enumerate(("P", "Pbar")):
-        log.info(f"Computing singular values of {name}")
-        log.info(f"{name} matrix shape: {P_np[i].shape}")
-
-        start = time.perf_counter()
-
-        # Singular values only: no U or Vdag.
-        S = scipy.linalg.svdvals(P_np[i])
-
-        elapsed = time.perf_counter() - start
-        
-        singular_values.append(S)
-
-        # Save immediately so an expensive SVD is not lost.
-        with h5py.File(low_rank_file, "a") as fp:
-            dataset_name = f"S_{name}"
-            if dataset_name in fp:
-                del fp[dataset_name]
-            fp[dataset_name] = S
-
-        log.info(f"{name} SVD time: {elapsed:.3f} s")
-        log.info(f"{name} number of singular values: {len(S)}")
-        log.info(f"{name} largest singular value: {S[0]:.6e}")
-        log.info(f"{name} smallest singular value: {S[-1]:.6e}")
-
-        # Cumulative fraction of sum of singular values.
-        cumulative = np.cumsum(S**2) / np.sum(S**2)
-
-        for fraction in (0.50, 0.90, 0.99):
-            n_required = np.searchsorted(cumulative, fraction) + 1
-            log.info(
-                f"{name}: {100*fraction:.0f}% cumulative squared singular-value "
-                f"weight requires {n_required} / {len(S)} modes "
-                f"({100*n_required/len(S):.2f}%)"
-            )
-
-    # ---------------------------------------------------------
-    # Plot 1: singular-value spectrum
-    # ---------------------------------------------------------
-
-    plt.figure(figsize=(6, 4))
-
-    for S, name in zip(singular_values, ("P", "Pbar")):
-        index = np.arange(1, len(S) + 1)
-        plt.semilogy(index, S, label=name)
-
-    plt.xlabel("Singular-value index")
-    plt.ylabel("Singular value")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("singular_value_spectrum.pdf")
-    plt.close()
-
-    # ---------------------------------------------------------
-    # Plot 2: cumulative singular-value weight
-    # ---------------------------------------------------------
-
-    plt.figure(figsize=(6, 4))
-
-    for S, name in zip(singular_values, ("P", "Pbar")):
-        index = np.arange(1, len(S) + 1)
-        cumulative = np.cumsum(S**2) / np.sum(S**2)
-        plt.plot(index, cumulative, label=name)
-
-    plt.axhline(0.50, linestyle="--", linewidth=0.8)
-    plt.axhline(0.90, linestyle="--", linewidth=0.8)
-    plt.axhline(0.99, linestyle="--", linewidth=0.8)
-
-    plt.xlabel("Number of singular values retained")
-    plt.ylabel("Cumulative fraction")
-    plt.ylim(0.0, 1.01)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("singular_value_cumulative.pdf")
-    plt.close()
-    
-    
 
 def main():
     parser = argparse.ArgumentParser(
         prog="python -m qimpy.transport.material.ab_initio.make_low_rank",
-        description="Analyze singular-value spectrum of Lindblad scattering",
+        description="Observable-preserving low-rank Lindblad scattering",
     )
+
     parser.add_argument(
         "-i",
         "--input_file",
@@ -142,6 +352,7 @@ def main():
         required=True,
         help="YAML input file",
     )
+
     parser.add_argument(
         "-o",
         "--output-file",
@@ -150,23 +361,32 @@ def main():
     )
 
     args = parser.parse_args()
+
     io.log_config(output_file=args.output_file)
 
-    # Print version header
-    log.info("*" * 15 + " QimPy " + qimpy.__version__ + " " + "*" * 15)
+    log.info(
+        "*" * 15
+        + " QimPy "
+        + qimpy.__version__
+        + " " * 1
+        + "*" * 15
+    )
 
-    # Configure hardware resources
     rc.init()
 
-    # Load input parameters from YAML file:
-    input_dict = io.dict.key_cleanup(io.yaml.load(args.input_file))
-    log.info(f"\n# Processed input:\n{io.yaml.dump(input_dict)}")
-    input_dict = io.dict.remove_units(input_dict)  # Remove units
+    input_dict = io.dict.key_cleanup(
+        io.yaml.load(args.input_file)
+    )
 
-    # Analyze singular-value spectrum:
+    log.info(
+        f"\n# Processed input:\n"
+        f"{io.yaml.dump(input_dict)}"
+    )
+
+    input_dict = io.dict.remove_units(input_dict)
+
     generate_low_rank(**input_dict)
 
-    # Cleanup and report timings:
     rc.free()
     rc.report_end()
     StopWatch.print_stats()
@@ -174,3 +394,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
